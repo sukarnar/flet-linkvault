@@ -1,6 +1,7 @@
 """LinkVault - save, share and safely open websites. Flet web app entry point."""
 import asyncio
 import logging
+from pathlib import Path
 
 import flet as ft
 
@@ -8,6 +9,7 @@ import db
 import security
 from config import RESCAN_HOURS
 from ui import App
+from web_patch import build_assets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("linkvault")
@@ -42,4 +44,5 @@ async def main(page: ft.Page):
 
 if __name__ == "__main__":
     # In the container Flet runs as a web server (see FLET_* variables in the Dockerfile)
-    ft.run(main, view=ft.AppView.WEB_BROWSER)
+    assets = build_assets(Path(__file__).parent / "assets")
+    ft.run(main, view=ft.AppView.WEB_BROWSER, assets_dir=str(assets))

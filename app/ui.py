@@ -59,6 +59,11 @@ class App:
         self.user: Optional[dict] = None
         self.token: Optional[str] = None
         self.prefs = ft.SharedPreferences()
+        self._closed = False
+        # Invisible control whose value changes every 20 s. Each change is a tiny message
+        # to the browser, which lets the watchdog in web_patch.py tell a healthy connection
+        # from a dead one, and keeps proxies/NATs from dropping an idle WebSocket.
+        self._beat = ft.Text("0", size=1, opacity=0)
 
     # ================================================================== plumbing
     async def start(self):
@@ -69,12 +74,29 @@ class App:
         p.padding = ft.Padding.symmetric(horizontal=12, vertical=16)
         p.scroll = ft.ScrollMode.AUTO
         p.on_route_change = self._on_route_change
+        p.on_close = self._on_close
+        p.overlay.append(self._beat)
+        p.run_task(self._heartbeat)
         try:
             self.token = await self.prefs.get(TOKEN_KEY)
         except Exception as e:  # storage unavailable (private mode etc.)
             log.info("shared preferences unavailable: %s", e)
         self.user = auth.resume_session(self.token)
         await self.render()
+
+    async def _on_close(self, e=None):
+        self._closed = True
+
+    async def _heartbeat(self):
+        n = 0
+        while not self._closed:
+            await asyncio.sleep(20)
+            n += 1
+            self._beat.value = str(n)
+            try:
+                self._beat.update()
+            except Exception:
+                pass  # disconnected: Flet drops updates until the client reconnects
 
     async def _on_route_change(self, e):
         await self.render()
