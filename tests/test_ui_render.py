@@ -28,7 +28,11 @@ class FakePage:
         self.route, self.client_ip, self.url = "/", "203.0.113.9", "https://links.example.com/"
         self.controls, self.appbar, self.navigation_bar, self.scroll = [], None, None, None
         self.dialogs, self._services, self.on_route_change = [], _Services(), None
-        self.title = self.theme = self.theme_mode = self.padding = None
+        self.title = self.theme = self.theme_mode = self.padding = self.on_close = None
+        self.overlay = []
+
+    def run_task(self, fn, *args):
+        pass  # heartbeat not needed in tests
 
     def update(self):
         # walk the tree to make sure everything is a real control
