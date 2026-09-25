@@ -12,12 +12,18 @@ import flet_webview as fwv
 import auth
 import db
 import ratelimit
+import palette
 import security
+from palette import DISPLAY, STRONG
 from config import ADMIN_USERNAMES, ANON_SHARE_DAYS, APP_NAME, PUBLIC_BASE_URL, RESCAN_HOURS
 
 log = logging.getLogger("linkvault.ui")
 
 TOKEN_KEY = "linkvault.session"
+THEME_KEY = "linkvault.theme"
+THEME_MODES = {"system": (ft.Icons.BRIGHTNESS_AUTO, "Theme: follow system"),
+               "light": (ft.Icons.LIGHT_MODE, "Theme: light"),
+               "dark": (ft.Icons.DARK_MODE, "Theme: dark")}
 MAX_TITLE, MAX_NOTE = 200, 1000
 
 VISIBILITY = {
@@ -26,10 +32,11 @@ VISIBILITY = {
     "public": ("Public", ft.Icons.PUBLIC),
     "unlisted": ("Anyone with the link", ft.Icons.LINK),
 }
+# label, icon, palette key (text colour = key, tint = key + "_bg")
 STATUS = {
-    security.SAFE: ("Checked", ft.Icons.GPP_GOOD, ft.Colors.GREEN_700),
-    security.WARN: ("Caution", ft.Icons.GPP_MAYBE, ft.Colors.AMBER_800),
-    security.BLOCKED: ("Blocked", ft.Icons.GPP_BAD, ft.Colors.RED_700),
+    security.SAFE: ("Checked", ft.Icons.GPP_GOOD, "safe"),
+    security.WARN: ("Caution", ft.Icons.GPP_MAYBE, "caution"),
+    security.BLOCKED: ("Blocked", ft.Icons.GPP_BAD, "blocked"),
 }
 REPORT_REASONS = ["Phishing or scam", "Malware or dangerous download", "Spam",
                   "Adult, violent or hateful content", "Other"]
@@ -59,6 +66,8 @@ class App:
         self.user: Optional[dict] = None
         self.token: Optional[str] = None
         self.prefs = ft.SharedPreferences()
+        self.theme_choice = "system"
+        self.c = palette.LIGHT
         self._closed = False
         # Invisible control whose value changes every 20 s. Each change is a tiny message
         # to the browser, which lets the watchdog in web_patch.py tell a healthy connection
@@ -69,8 +78,10 @@ class App:
     async def start(self):
         p = self.page
         p.title = APP_NAME
-        p.theme = ft.Theme(color_scheme_seed=ft.Colors.INDIGO)
-        p.theme_mode = ft.ThemeMode.SYSTEM
+        p.fonts = palette.FONTS
+        p.theme = palette.make_theme(palette.LIGHT, dark=False)
+        p.dark_theme = palette.make_theme(palette.DARK, dark=True)
+        p.on_platform_brightness_change = self._on_route_change
         p.padding = ft.Padding.symmetric(horizontal=12, vertical=16)
         p.scroll = ft.ScrollMode.AUTO
         p.on_route_change = self._on_route_change
@@ -79,6 +90,9 @@ class App:
         p.run_task(self._heartbeat)
         try:
             self.token = await self.prefs.get(TOKEN_KEY)
+            saved = await self.prefs.get(THEME_KEY)
+            if saved in THEME_MODES:
+                self.theme_choice = saved
         except Exception as e:  # storage unavailable (private mode etc.)
             log.info("shared preferences unavailable: %s", e)
         self.user = auth.resume_session(self.token)
@@ -114,6 +128,26 @@ class App:
             await self.page.push_route(route)
 
     @property
+    def dark(self) -> bool:
+        if self.theme_choice == "system":
+            return getattr(self.page, "platform_brightness", None) == ft.Brightness.DARK
+        return self.theme_choice == "dark"
+
+    def apply_theme(self):
+        self.c = palette.DARK if self.dark else palette.LIGHT
+        self.page.theme_mode = ft.ThemeMode.DARK if self.dark else ft.ThemeMode.LIGHT
+        self.page.bgcolor = self.c["canvas"]
+
+    async def cycle_theme(self):
+        order = list(THEME_MODES)
+        self.theme_choice = order[(order.index(self.theme_choice) + 1) % len(order)]
+        try:
+            await self.prefs.set(THEME_KEY, self.theme_choice)
+        except Exception:
+            pass
+        await self.render()
+
+    @property
     def is_admin(self) -> bool:
         return bool(self.user and self.user["username"].lower() in ADMIN_USERNAMES)
 
@@ -132,7 +166,8 @@ class App:
 
     def snack(self, message: str, error: bool = False):
         self.page.show_dialog(ft.SnackBar(
-            ft.Text(message), bgcolor=ft.Colors.RED_700 if error else None, duration=3500))
+            ft.Text(message, color=self.c["canvas"]), bgcolor=self.c["blocked"] if error else self.c["ink"],
+            duration=3500, behavior=ft.SnackBarBehavior.FLOATING))
 
     def close_dialog(self):
         self.page.pop_dialog()
@@ -167,8 +202,8 @@ class App:
             content=ft.Column([ft.Text(l) for l in lines], tight=True, spacing=6),
             actions=[
                 ft.TextButton("Cancel", on_click=lambda: finish(False)),
-                ft.Button(ok_text, on_click=lambda: finish(True),
-                          color=ft.Colors.RED_700 if danger else None),
+                ft.FilledButton(ok_text, on_click=lambda: finish(True),
+                          bgcolor=self.c["blocked"] if danger else None),
             ],
         ))
         return await done
@@ -206,7 +241,8 @@ class App:
         )
 
     def _appbar(self) -> ft.AppBar:
-        actions = []
+        icon, tip = THEME_MODES[self.theme_choice]
+        actions = [ft.IconButton(icon, tooltip=tip, on_click=self.act(self.cycle_theme))]
         if self.user:
             actions.append(ft.IconButton(ft.Icons.BOLT, tooltip="Quick share a link",
                                          on_click=self.act(self.go, "/quick")))
@@ -224,8 +260,9 @@ class App:
                 ],
             ))
         return ft.AppBar(
-            leading=ft.Icon(ft.Icons.BOOKMARKS_OUTLINED), leading_width=40,
-            title=ft.Text(APP_NAME, weight=ft.FontWeight.BOLD), actions=actions,
+            leading=ft.Icon(ft.Icons.BOOKMARK, color=self.c["ribbon"], size=26), leading_width=44,
+            title=ft.Text(APP_NAME, font_family=DISPLAY, size=24, color=self.c["ink"]),
+            actions=actions, bgcolor=self.c["canvas"], elevation=0, elevation_on_scroll=0,
         )
 
     def _frame(self, controls: list[ft.Control]) -> ft.Control:
@@ -253,6 +290,7 @@ class App:
             await self.go("/links")
             return
 
+        self.apply_theme()
         try:
             if path == "/":
                 content = self.view_home()
@@ -283,6 +321,7 @@ class App:
             content = [ft.Text("Something went wrong loading this page.", color=ft.Colors.ERROR)]
 
         self.page.scroll = ft.ScrollMode.AUTO
+        self.apply_theme()
         self.page.appbar = self._appbar()
         self.page.navigation_bar = self._nav(path)
         self.page.controls = [self._frame(content)]
@@ -290,10 +329,10 @@ class App:
 
     # ================================================================== reusable pieces
     def heading(self, text: str, sub: str = "") -> ft.Control:
-        items = [ft.Text(text, size=24, weight=ft.FontWeight.BOLD)]
+        items = [ft.Text(text, size=32, font_family=DISPLAY, color=self.c["ink"])]
         if sub:
-            items.append(ft.Text(sub, color=ft.Colors.ON_SURFACE_VARIANT))
-        return ft.Column(items, spacing=4)
+            items.append(ft.Text(sub, size=15, color=self.c["muted"]))
+        return ft.Container(ft.Column(items, spacing=2), padding=ft.Padding.only(top=4, bottom=4))
 
     def empty(self, text: str, icon=ft.Icons.BOOKMARK_OUTLINE) -> ft.Control:
         return ft.Container(
@@ -304,11 +343,27 @@ class App:
                               horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         )
 
-    def card(self, controls: list[ft.Control]) -> ft.Card:
-        return ft.Card(content=ft.Container(ft.Column(controls, spacing=10), padding=16))
+    def card(self, controls: list[ft.Control]) -> ft.Control:
+        return ft.Container(
+            ft.Column(controls, spacing=10), padding=16, bgcolor=self.c["surface"],
+            border=ft.Border.all(1, self.c["line"]), border_radius=14,
+        )
+
+    def ribbon_card(self, controls: list[ft.Control], ribbon: str) -> ft.Control:
+        """Card with a bookmark ribbon on its left edge (colour = who can see the link)."""
+        return ft.Container(
+            bgcolor=self.c["surface"], border=ft.Border.all(1, self.c["line"]), border_radius=14,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            content=ft.Container(
+                ft.Column(controls, spacing=8),
+                border=ft.Border(left=ft.BorderSide(5, ribbon)),
+                padding=ft.Padding.only(left=16, right=8, top=12, bottom=6),
+            ),
+        )
 
     def status_chip(self, link: dict) -> ft.Control:
-        label, icon, color = STATUS[link["status"]]
+        label, icon, key = STATUS[link["status"]]
+        color, tint = self.c[key], self.c[key + "_bg"]
 
         async def show():
             if link["reasons"]:
@@ -322,21 +377,21 @@ class App:
                 ], icon, color)
 
         return ft.Container(
-            content=ft.Row([ft.Icon(icon, size=16, color=color),
-                            ft.Text(label, size=12, color=color, weight=ft.FontWeight.W_600)],
+            content=ft.Row([ft.Icon(icon, size=15, color=color),
+                            ft.Text(label, size=12, color=color, font_family=STRONG)],
                            spacing=4, tight=True),
-            padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-            border=ft.Border.all(1, color), border_radius=12,
+            padding=ft.Padding.symmetric(horizontal=9, vertical=4),
+            bgcolor=tint, border_radius=20,
             on_click=show, ink=True, tooltip="Why?",
         )
 
-    def small_chip(self, text: str, icon, on_click=None) -> ft.Control:
+    def small_chip(self, text: str, icon, on_click=None, icon_color=None) -> ft.Control:
         return ft.Container(
-            content=ft.Row([ft.Icon(icon, size=14, color=ft.Colors.ON_SURFACE_VARIANT),
-                            ft.Text(text, size=12, color=ft.Colors.ON_SURFACE_VARIANT)],
+            content=ft.Row([ft.Icon(icon, size=14, color=icon_color or self.c["muted"]),
+                            ft.Text(text, size=12, color=self.c["muted"])],
                            spacing=4, tight=True),
-            padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST, border_radius=12,
+            padding=ft.Padding.symmetric(horizontal=9, vertical=4),
+            border=ft.Border.all(1, self.c["line"]), border_radius=20,
             on_click=on_click, ink=on_click is not None,
         )
 
@@ -352,15 +407,15 @@ class App:
         # Caution links: show the warning first; the real "open" button lives in the dialog
         def warn_first():
             self.page.show_dialog(ft.AlertDialog(
-                icon=ft.Icon(ft.Icons.GPP_MAYBE, color=ft.Colors.AMBER_800),
+                icon=ft.Icon(ft.Icons.GPP_MAYBE, color=self.c["caution"]),
                 title=ft.Text("Proceed with caution"),
                 content=ft.Column(
                     [ft.Text(f"• {r}") for r in link["reasons"]]
-                    + [ft.Text(url, size=12, selectable=True, color=ft.Colors.ON_SURFACE_VARIANT)],
+                    + [ft.Text(url, size=12, selectable=True, color=self.c["muted"])],
                     tight=True, spacing=6),
                 actions=[
                     ft.TextButton("Cancel", on_click=self.close_dialog),
-                    ft.Button("Open anyway", icon=ft.Icons.OPEN_IN_NEW,
+                    ft.FilledButton("Open anyway", icon=ft.Icons.OPEN_IN_NEW,
                               action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK),
                               on_click=self.close_dialog),
                 ],
@@ -411,7 +466,8 @@ class App:
         chips = [self.status_chip(link)]
         if mine:
             vis_label, vis_icon = VISIBILITY[link["visibility"]]
-            chips.append(self.small_chip(vis_label, vis_icon, on_click=self.act(self.edit_link_dialog, link)))
+            chips.append(self.small_chip(vis_label, vis_icon, on_click=self.act(self.edit_link_dialog, link),
+                                         icon_color=self.c["vis_" + link["visibility"]]))
         elif show_owner and link.get("owner_name"):
             chips.append(self.small_chip(f"@{link['owner_name']}", ft.Icons.PERSON,
                                          on_click=self.act(self.go, f"/u/{link['owner_name']}")))
@@ -420,18 +476,20 @@ class App:
 
         body = [
             ft.Row([
-                ft.Icon(ft.Icons.LANGUAGE, color=ft.Colors.PRIMARY),
                 ft.Column([
-                    ft.Text(title, weight=ft.FontWeight.W_600, size=16, max_lines=2,
-                            overflow=ft.TextOverflow.ELLIPSIS),
-                    ft.Text(f"{security.display_domain(link['domain'])} · {time_ago(link['created_at'])}",
-                            size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    ft.Text(title, font_family=STRONG, size=16, max_lines=2,
+                            overflow=ft.TextOverflow.ELLIPSIS, color=self.c["ink"]),
+                    ft.Row([
+                        ft.Text(security.display_domain(link["domain"]), size=13, color=self.c["primary"],
+                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.Text(time_ago(link["created_at"]), size=12, color=self.c["muted"]),
+                    ], spacing=10),
                 ], spacing=2, expand=True),
                 ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, items=menu_items),
             ], vertical_alignment=ft.CrossAxisAlignment.START),
         ]
         if link["note"]:
-            body.append(ft.Text(link["note"], selectable=True))
+            body.append(ft.Text(link["note"], selectable=True, color=self.c["ink"]))
         body.append(ft.Row(chips, wrap=True, spacing=6, run_spacing=6))
         if not blocked:
             body.append(ft.Row([
@@ -439,7 +497,7 @@ class App:
                 self.open_browser_button(link),
                 self.copy_button(link["final_url"]),
             ], spacing=0))
-        return self.card(body)
+        return self.ribbon_card(body, self.c["vis_" + link["visibility"]])
 
     def link_list(self, links: list[dict], empty_text: str, **card_kwargs) -> ft.Control:
         if not links:
@@ -449,7 +507,9 @@ class App:
     def visibility_dropdown(self, value: str, allow_unlisted: bool = True) -> ft.Dropdown:
         return ft.Dropdown(
             label="Who can see it", value=value, width=260,
-            options=[ft.DropdownOption(key=k, text=v[0]) for k, v in VISIBILITY.items()
+            options=[ft.DropdownOption(key=k, text=v[0],
+                                       leading_icon=ft.Icon(ft.Icons.BOOKMARK, color=self.c["vis_" + k]))
+                     for k, v in VISIBILITY.items()
                      if allow_unlisted or k != "unlisted"],
         )
 
@@ -465,7 +525,7 @@ class App:
             self.page.update()
         if result.blocked:
             await self.alert(f"This link can't be {action_text}", result.reasons,
-                             ft.Icons.GPP_BAD, ft.Colors.RED_700)
+                             ft.Icons.GPP_BAD, self.c["blocked"])
             return None
         if result.status == security.WARN:
             verb = {"saved": "Save", "shared": "Share"}.get(action_text, "Continue")
@@ -480,7 +540,7 @@ class App:
     async def view_link(self, link: dict):
         link = await self.ensure_fresh(link)
         if link["status"] == security.BLOCKED:
-            await self.alert("This link has been blocked", link["reasons"], ft.Icons.GPP_BAD, ft.Colors.RED_700)
+            await self.alert("This link has been blocked", link["reasons"], ft.Icons.GPP_BAD, self.c["blocked"])
             return
         if link["status"] == security.WARN:
             if not await self.confirm("Proceed with caution", [f"• {r}" for r in link["reasons"]],
@@ -500,13 +560,14 @@ class App:
         url = link["final_url"]
         title = link["title"] or security.display_domain(link["domain"])
         header = ft.Container(
-            padding=ft.Padding.symmetric(horizontal=4, vertical=4),
+            padding=ft.Padding.symmetric(horizontal=4, vertical=4), bgcolor=self.c["surface"],
+            border=ft.Border(bottom=ft.BorderSide(1, self.c["line"])),
             content=ft.Row([
                 ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Back", on_click=self.act(self.render)),
                 ft.Column([
-                    ft.Text(title, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.Text(title, font_family=STRONG, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
                     ft.Text(url, size=11, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
-                            color=ft.Colors.ON_SURFACE_VARIANT),
+                            color=self.c["muted"]),
                 ], spacing=0, expand=True),
                 ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser",
                               action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK)),
@@ -516,7 +577,7 @@ class App:
         if link["embeddable"]:
             body = ft.Column([
                 ft.Text("Page blank or refusing to load? Some sites block being shown inside "
-                        "other apps - use Open in browser.", size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                        "other apps - use Open in browser.", size=11, color=self.c["muted"]),
                 fwv.WebView(url=url, expand=True),
             ], expand=True, spacing=4)
         else:
@@ -526,14 +587,14 @@ class App:
                     ft.Icon(ft.Icons.LINK_OFF, size=48, color=ft.Colors.OUTLINE),
                     ft.Text(f"{security.display_domain(link['domain'])} doesn't allow itself to be "
                             "shown inside other apps.", text_align=ft.TextAlign.CENTER),
-                    ft.Button("Open in browser", icon=ft.Icons.OPEN_IN_NEW,
-                              action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK)),
+                    ft.FilledButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW,
+                                    action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK)),
                 ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
             )
         self.page.scroll = None
         self.page.appbar = None
         self.page.navigation_bar = None
-        self.page.controls = [ft.Column([header, ft.Divider(height=1), body], expand=True, spacing=0)]
+        self.page.controls = [ft.Column([header, body], expand=True, spacing=0)]
         self.page.update()
 
     async def edit_link_dialog(self, link: dict):
@@ -555,7 +616,7 @@ class App:
         self.page.show_dialog(ft.AlertDialog(
             title=ft.Text("Edit link"),
             content=ft.Column([title, note, vis], tight=True, width=420),
-            actions=[ft.TextButton("Cancel", on_click=self.close_dialog), ft.Button("Save", on_click=save)],
+            actions=[ft.TextButton("Cancel", on_click=self.close_dialog), ft.FilledButton("Save", on_click=save)],
         ))
 
     async def share_friends_dialog(self, link: dict):
@@ -582,7 +643,7 @@ class App:
             title=ft.Text("Share with friends"),
             content=ft.Column(boxes, tight=True, scroll=ft.ScrollMode.AUTO, height=min(300, 48 * len(boxes))),
             actions=[ft.TextButton("Cancel", on_click=self.close_dialog),
-                     ft.Button("Send", icon=ft.Icons.SEND, on_click=send)],
+                     ft.FilledButton("Send", icon=ft.Icons.SEND, on_click=send)],
         ))
 
     async def share_link_dialog(self, link: dict):
@@ -661,7 +722,7 @@ class App:
             title=ft.Text("Report link"),
             content=ft.Column([reason, details], tight=True, width=420),
             actions=[ft.TextButton("Cancel", on_click=self.close_dialog),
-                     ft.Button("Report", icon=ft.Icons.FLAG_OUTLINED, on_click=submit)],
+                     ft.FilledButton("Report", icon=ft.Icons.FLAG_OUTLINED, on_click=submit)],
         ))
 
     async def _background_rescan(self, link: dict):
@@ -715,7 +776,7 @@ class App:
         return [
             self.heading("Sign in", "Save links, share them with friends and build a public collection."),
             self.card([username, password, error,
-                       ft.Button("Sign in", icon=ft.Icons.LOGIN, on_click=submit),
+                       ft.FilledButton("Sign in", icon=ft.Icons.LOGIN, on_click=submit),
                        ft.TextButton("No account? Create one", on_click=self.act(self.go, f"/signup{suffix}"))]),
             ft.TextButton("Or share a link without an account", icon=ft.Icons.BOLT,
                           on_click=self.act(self.go, "/quick")),
@@ -751,7 +812,7 @@ class App:
         return [
             self.heading("Create an account"),
             self.card([username, password, password2, error,
-                       ft.Button("Create account", icon=ft.Icons.PERSON_ADD, on_click=submit),
+                       ft.FilledButton("Create account", icon=ft.Icons.PERSON_ADD, on_click=submit),
                        ft.TextButton("Already have an account? Sign in",
                                      on_click=self.act(self.go, "/login"))]),
         ]
@@ -762,35 +823,49 @@ class App:
                 ft.TextButton("Go home", on_click=self.act(self.go, "/"))]
 
     def view_home(self) -> list[ft.Control]:
-        def feature(icon, title, text):
-            return ft.Row([ft.Icon(icon, color=ft.Colors.PRIMARY),
-                           ft.Column([ft.Text(title, weight=ft.FontWeight.W_600), ft.Text(text)],
-                                     spacing=2, expand=True)],
-                          vertical_alignment=ft.CrossAxisAlignment.START)
+        c = self.c
+
+        def ribbon_row(key: str, label: str, text: str) -> ft.Control:
+            return ft.Row([
+                ft.Container(width=5, height=34, bgcolor=c["vis_" + key], border_radius=3),
+                ft.Column([ft.Text(label, font_family=STRONG, color=c["ink"]),
+                           ft.Text(text, size=13, color=c["muted"])], spacing=0, expand=True),
+            ], spacing=12)
+
+        def point(icon, title, text) -> ft.Control:
+            return ft.Row([ft.Icon(icon, color=c["primary"], size=22),
+                           ft.Column([ft.Text(title, font_family=STRONG, color=c["ink"]),
+                                      ft.Text(text, color=c["muted"])], spacing=2, expand=True)],
+                          vertical_alignment=ft.CrossAxisAlignment.START, spacing=12)
 
         return [
-            ft.Container(height=8),
-            ft.Text(APP_NAME, size=34, weight=ft.FontWeight.BOLD),
-            ft.Text("Save the websites you like, find them later, and share them safely.", size=16),
-            ft.Row([ft.Button("Create free account", icon=ft.Icons.PERSON_ADD,
-                              on_click=self.act(self.go, "/signup")),
+            ft.Container(height=12),
+            ft.Text("Keep the websites\nyou want to come back to.", font_family=DISPLAY, size=46,
+                    color=c["ink"]),
+            ft.Text("Save links, decide who sees each one, and share them after a safety check.",
+                    size=17, color=c["muted"]),
+            ft.Row([ft.FilledButton("Create free account", icon=ft.Icons.PERSON_ADD,
+                                    on_click=self.act(self.go, "/signup")),
                     ft.OutlinedButton("Sign in", on_click=self.act(self.go, "/login"))], wrap=True),
+            ft.Container(height=6),
             self.card([
-                feature(ft.Icons.BOLT, "Share without an account",
-                        "Paste a link and get a short share link to send to anyone."),
-                ft.Row([ft.FilledTonalButton("Quick share", icon=ft.Icons.BOLT,
-                                             on_click=self.act(self.go, "/quick"))]),
+                ft.Text("Every saved link carries a ribbon", font_family=STRONG, size=16, color=c["ink"]),
+                ribbon_row("private", "Only me", "Your private reading list."),
+                ribbon_row("friends", "Friends", "Visible to people you've added."),
+                ribbon_row("public", "Public", "Listed on your profile and in Explore."),
+                ribbon_row("unlisted", "Anyone with the link", "Hidden, but shareable without an account."),
             ]),
             self.card([
-                feature(ft.Icons.SHIELD, "Every link is safety-checked",
-                        "We block dangerous addresses and warn you about suspicious ones before you open them."),
-                feature(ft.Icons.PEOPLE, "Private, friends-only or public",
-                        "You decide who sees each link."),
-                feature(ft.Icons.VISIBILITY, "Built-in viewer",
-                        "Preview pages inside the app, or open them in your browser."),
+                point(ft.Icons.SHIELD, "Checked before it's saved",
+                      "Dangerous addresses are refused. Suspicious ones are labelled, and you confirm before opening."),
+                point(ft.Icons.VISIBILITY, "Read here or in your browser",
+                      "Preview pages in the built-in viewer, or open them in a new tab."),
+                point(ft.Icons.BOLT, "Share without an account",
+                      "Paste a link, get a share link, send it to anyone."),
+                ft.Row([ft.OutlinedButton("Quick share", icon=ft.Icons.BOLT, on_click=self.act(self.go, "/quick")),
+                        ft.TextButton("Browse public links", icon=ft.Icons.EXPLORE,
+                                      on_click=self.act(self.go, "/explore"))], wrap=True),
             ]),
-            ft.TextButton("Browse public links", icon=ft.Icons.EXPLORE,
-                          on_click=self.act(self.go, "/explore")),
         ]
 
     def view_links(self) -> list[ft.Control]:
@@ -800,7 +875,7 @@ class App:
         note = ft.TextField(label="Note (optional)", multiline=True, max_lines=3, max_length=MAX_NOTE)
         vis = self.visibility_dropdown("private", allow_unlisted=False)
         ring = ft.ProgressRing(width=20, height=20, visible=False)
-        save_btn = ft.Button("Check & save", icon=ft.Icons.BOOKMARK_ADD)
+        save_btn = ft.FilledButton("Check & save", icon=ft.Icons.BOOKMARK_ADD)
         search = ft.TextField(hint_text="Search your links", prefix_icon=ft.Icons.SEARCH, dense=True)
         results = ft.Column()
 
@@ -902,19 +977,19 @@ class App:
                                trailing=trailing, on_click=self.act(self.go, f"/u/{u['username']}"))
 
         out = [self.heading("Friends", "Friends can see your friends-only links, and you can send them links."),
-               self.card([ft.Row([name, ft.Button("Send request", on_click=send)])])]
+               self.card([ft.Row([name, ft.FilledButton("Send request", on_click=send)])])]
         if incoming:
-            out.append(ft.Text("Requests", weight=ft.FontWeight.W_600))
+            out.append(ft.Text("Requests", font_family=STRONG))
             out += [person(u, ft.Row([
                 ft.IconButton(ft.Icons.CHECK, tooltip="Accept", on_click=self.act(accept, u["id"])),
                 ft.IconButton(ft.Icons.CLOSE, tooltip="Decline", on_click=self.act(remove, u["id"], "Decline", False)),
             ], tight=True)) for u in incoming]
-        out.append(ft.Text(f"Your friends ({len(friends)})", weight=ft.FontWeight.W_600))
+        out.append(ft.Text(f"Your friends ({len(friends)})", font_family=STRONG))
         out += [person(u, ft.IconButton(ft.Icons.PERSON_REMOVE, tooltip="Remove friend",
                                         on_click=self.act(remove, u["id"], "Remove friend")))
                 for u in friends] or [self.empty("No friends yet. Send a request above.", ft.Icons.GROUP)]
         if outgoing:
-            out.append(ft.Text("Waiting for reply", weight=ft.FontWeight.W_600))
+            out.append(ft.Text("Waiting for reply", font_family=STRONG))
             out += [person(u, ft.TextButton("Cancel", on_click=self.act(remove, u["id"], "Cancel", False)))
                     for u in outgoing]
         return out
@@ -950,8 +1025,8 @@ class App:
         sub = ("This is how friends see your profile." if is_self else
                "Public and friends-only links." if friends else "Public links.")
         return [
-            ft.Row([ft.Icon(ft.Icons.ACCOUNT_CIRCLE, size=48),
-                    ft.Column([ft.Text(f"@{owner['username']}", size=24, weight=ft.FontWeight.BOLD),
+            ft.Row([ft.Icon(ft.Icons.ACCOUNT_CIRCLE, size=48, color=self.c["ribbon"]),
+                    ft.Column([ft.Text(f"@{owner['username']}", size=30, font_family=DISPLAY, color=self.c["ink"]),
                                ft.Text(sub, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True)]
                    + ([action] if action else []), wrap=True),
             self.link_list(links, "No links to show.", show_owner=False),
@@ -971,10 +1046,11 @@ class App:
         out = [self.heading("A link was shared with you", f"Shared by {by}.")]
         if share["status"] == security.WARN:
             out.append(ft.Container(
-                bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.AMBER), border_radius=8, padding=12,
-                content=ft.Row([ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.AMBER_800),
+                bgcolor=self.c["caution_bg"], border_radius=12, padding=14,
+                content=ft.Row([ft.Icon(ft.Icons.WARNING_AMBER, color=self.c["caution"]),
                                 ft.Text("Our safety check found something unusual about this link. "
-                                        "Tap 'Caution' below to see why.", expand=True)])))
+                                        "Tap 'Caution' below to see why.", expand=True,
+                                        color=self.c["caution"])])))
         out.append(self.link_card(share, show_owner=False))
         if share.get("expires_at"):
             out.append(ft.Text(f"This share link expires in {max(1, (share['expires_at'] - db.now()) // 86400)} days.",
@@ -990,7 +1066,7 @@ class App:
         title = ft.TextField(label="Title (optional)", max_length=MAX_TITLE)
         note = ft.TextField(label="Message (optional)", multiline=True, max_lines=3, max_length=MAX_NOTE)
         ring = ft.ProgressRing(width=20, height=20, visible=False)
-        btn = ft.Button("Check & create share link", icon=ft.Icons.BOLT)
+        btn = ft.FilledButton("Check & create share link", icon=ft.Icons.BOLT)
         result_area = ft.Column()
 
         async def create():
@@ -1009,8 +1085,8 @@ class App:
             share = self.share_url(db.create_share_code(link_id, owner, expires))
             url.value = title.value = note.value = ""
             result_area.controls = [self.card([
-                ft.Row([ft.Icon(ft.Icons.CHECK_CIRCLE, color=ft.Colors.GREEN_700),
-                        ft.Text("Your share link is ready", weight=ft.FontWeight.W_600)]),
+                ft.Row([ft.Icon(ft.Icons.CHECK_CIRCLE, color=self.c["safe"]),
+                        ft.Text("Your share link is ready", font_family=STRONG)]),
                 ft.Row([ft.TextField(value=share, read_only=True, expand=True, dense=True),
                         self.copy_button(share)]),
                 ft.Text(f"Expires in {ANON_SHARE_DAYS} days." if expires else
@@ -1048,11 +1124,11 @@ class App:
         rows = []
         for l in db.list_reported_links():
             rows.append(self.card([
-                ft.Text(l["title"] or l["domain"], weight=ft.FontWeight.W_600),
+                ft.Text(l["title"] or l["domain"], font_family=STRONG),
                 ft.Text(l["final_url"], size=12, selectable=True),
-                ft.Text(f"Owner: {'@' + l['owner_name'] if l['owner_name'] else 'anonymous'} · "
-                        f"{l['report_count']} report(s) · {'hidden' if l['hidden'] else 'visible'} · "
-                        f"status: {l['status']}", size=12),
+                ft.Text(f"Owner: {'@' + l['owner_name'] if l['owner_name'] else 'anonymous'}", size=12),
+                ft.Text(f"{l['report_count']} report(s), {'hidden' if l['hidden'] else 'visible'}, "
+                        f"status {l['status']}", size=12, color=self.c["muted"]),
                 *[ft.Text(f"“{r}”", size=12, italic=True) for r in l["report_reasons"]],
                 ft.Row([ft.TextButton("Block link", icon=ft.Icons.BLOCK, on_click=self.act(block, l)),
                         ft.TextButton("Block domain", icon=ft.Icons.BLOCK, on_click=self.act(block, l, True)),

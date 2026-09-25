@@ -18,6 +18,7 @@ The server sends a heartbeat every 20 s (see App._heartbeat). The watchdog below
 Flet serves index.html from the assets directory when one exists there, so this needs
 no fork of Flet and keeps working when Flet is upgraded.
 """
+import shutil
 from pathlib import Path
 
 import flet_web
@@ -99,4 +100,8 @@ def build_assets(assets_dir: Path) -> Path:
         html = html.replace("</head>", WATCHDOG + "</head>", 1)
     assets_dir.mkdir(parents=True, exist_ok=True)
     (assets_dir / "index.html").write_text(html, encoding="utf-8")
+    # self-hosted fonts (see palette.FONTS)
+    fonts_src = Path(__file__).parent / "fonts"
+    if fonts_src.is_dir():
+        shutil.copytree(fonts_src, assets_dir / "fonts", dirs_exist_ok=True)
     return assets_dir
