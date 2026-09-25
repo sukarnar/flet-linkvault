@@ -1,0 +1,111 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # "Run workflow" button for manual redeploys
+
+# Never run two deploys at the same time; a newer push cancels an older one
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  APP_DIR: /opt/flet-traefik-demo   # folder on the VPS holding docker-compose.yml + .env
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Security checks
+        run: python tests/test_security.py
+      - name: Render every screen
+        run: python tests/test_ui_render.py
+      - name: End-to-end flows
+        run: python tests/test_flows.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # allows pushing to GitHub Container Registry
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Produces ghcr.io/<owner>/<repo>:latest and :sha-<short-sha> (lower-cased)
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # Ship the latest compose file so label/config changes deploy too.
+      # .env stays on the server and is never in Git.
+      - name: Copy docker-compose.yml to VPS
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          source: docker-compose.yml
+          target: ${{ env.APP_DIR }}
+
+      - name: Pull new image and restart
+        uses: appleboy/ssh-action@v1
+        env:
+          APP_DIR: ${{ env.APP_DIR }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          envs: APP_DIR,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -e
+            cd "$APP_DIR"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose pull flet-app
+            # --wait blocks until the healthcheck passes; the job fails if it doesn't
+            docker compose up -d --no-build --remove-orphans --wait --wait-timeout 120
+            docker logout ghcr.io
+            docker image prune -f
+            docker compose ps

@@ -1,0 +1,39 @@
+services:
+  flet-app:
+    build: .                                 # used only for local builds
+    image: ${IMAGE:-linkvault}:${IMAGE_TAG:-latest}
+    container_name: linkvault
+    restart: unless-stopped
+    environment:
+      APP_TITLE: ${APP_TITLE:-LinkVault}
+      PUBLIC_BASE_URL: https://${APP_DOMAIN}
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
+      GOOGLE_SAFE_BROWSING_API_KEY: ${GOOGLE_SAFE_BROWSING_API_KEY:-}
+      ANON_SHARE_DAYS: ${ANON_SHARE_DAYS:-30}
+    volumes:
+      - linkvault-data:/data                 # SQLite database + blocklist survive redeploys
+    # No "ports:" - Traefik reaches the container over its Docker network
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK}
+      - traefik.http.routers.linkvault.rule=Host(`${APP_DOMAIN}`)
+      - traefik.http.routers.linkvault.entrypoints=${TRAEFIK_ENTRYPOINT}
+      - traefik.http.routers.linkvault.tls=true
+      - traefik.http.routers.linkvault.tls.certresolver=${CERT_RESOLVER}
+      - traefik.http.routers.linkvault.middlewares=linkvault-headers
+      - traefik.http.services.linkvault.loadbalancer.server.port=8000
+      # Security headers for the app itself (the app must not be framed by other sites)
+      - traefik.http.middlewares.linkvault-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.linkvault-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.linkvault-headers.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.linkvault-headers.headers.customFrameOptionsValue=SAMEORIGIN
+
+volumes:
+  linkvault-data:
+
+networks:
+  traefik:
+    name: ${TRAEFIK_NETWORK}
+    external: true
