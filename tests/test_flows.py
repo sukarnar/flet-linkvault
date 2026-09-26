@@ -81,22 +81,46 @@ async def main():
 
     # --- save a safe link (live scan of github.com)
     field(page, "Link").value = "github.com/flet-dev/flet"
-    await click(button(page, "Check & save"))
+    await click(button(page, "Save link"))
     links = db.list_user_links(app.user["id"])
     assert len(links) == 1 and links[0]["status"] == "safe", links
     print("ok  saved:", links[0]["title"][:50], "| embeddable:", bool(links[0]["embeddable"]))
 
     # --- blocked link is refused
     field(page, "Link").value = "http://169.254.169.254/latest/meta-data"
-    await click(button(page, "Check & save"))
+    await click(button(page, "Save link"))
     assert alerts and "can't be saved" in alerts[-1][0] and len(db.list_user_links(app.user["id"])) == 1
     print("ok  blocked:", alerts[-1][1][0])
 
     # --- duplicate
     field(page, "Link").value = "https://github.com/flet-dev/flet"
-    await click(button(page, "Check & save"))
+    await click(button(page, "Save link"))
     assert snacks[-1].startswith("You've already saved"), snacks[-1]
     print("ok  duplicate detected")
+
+    # --- categories: create, file a link, filter, auto-suggest by domain
+    uid = app.user["id"]
+    dev = db.create_category(uid, "Dev tools")
+    db.create_category(uid, "Reading")
+    first = db.list_user_links(uid)[0]
+    db.set_link_category(first["id"], uid, dev)
+    app.cat_filter = dev
+    await app.render()
+    chips = find(page.controls, lambda c: isinstance(c, ft.Chip))
+    labels = [ch.label.value for ch in chips]
+    assert "Dev tools  1" in labels and "Reading  0" in labels, labels
+    assert [ch for ch in chips if ch.selected][0].label.value == "Dev tools  1"
+    app.cat_filter = None
+    await app.render()
+    field(page, "Link").value = "https://github.com/flet-dev/flet-webview"
+    await click(button(page, "Save link"))
+    newest = db.list_user_links(uid)[0]
+    assert newest["category_name"] == "Dev tools", newest["category_name"]
+    print("ok  categories: filter chips + auto-filed by domain ->", snacks[-1])
+    await app.move_dialog(newest); await app.manage_categories_dialog(); await app.edit_link_dialog(newest)
+    assert len(page.dialogs) == 3
+    page.dialogs.clear()
+    print("ok  move / manage / edit dialogs")
 
     # --- serialize the whole page with Flet's wire encoder
     msgpack.packb(page.controls, default=encode)

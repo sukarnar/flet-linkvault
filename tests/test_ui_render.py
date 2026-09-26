@@ -77,6 +77,8 @@ async def main():
     code = db.create_share_code(l3, None, db.now() + 86400)
     code_warn = db.create_share_code(l2, alice["id"], None)
     db.report_link(l1, "ip:1", "Spam")
+    cat = db.create_category(alice["id"], "Recipes")
+    db.set_link_category(l1, alice["id"], cat)
 
     def fail(msg, *a, **k):
         raise AssertionError(msg % a if a else msg)
@@ -100,10 +102,14 @@ async def main():
     # dialogs & viewer
     app.user = alice
     link1, link2 = db.get_link(l1), db.get_link(l2)
-    for fn in (app.edit_link_dialog, app.share_friends_dialog, app.share_link_dialog, app.report_dialog):
+    for fn in (app.edit_link_dialog, app.share_friends_dialog, app.share_link_dialog, app.report_dialog,
+               app.move_dialog):
         await fn(link1)
         assert page.dialogs, fn.__name__
         page.dialogs.clear()
+    await app.manage_categories_dialog(); assert page.dialogs; page.dialogs.clear()
+    for f in (None, "none", cat):
+        app.cat_filter = f; page.route = "/links"; await app.render()
     app.open_browser_button(link2).on_click()        # warning dialog for caution links
     assert page.dialogs; page.dialogs.clear()
     app.show_viewer(link1); assert page.appbar is None   # embeddable -> WebView
