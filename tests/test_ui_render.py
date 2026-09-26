@@ -99,7 +99,7 @@ async def main():
             assert page.controls, r
             print(f"ok  {('@' + user['username']) if user else 'anon':7} {r:22} -> {page.route}")
 
-    # dialogs & viewer
+    # dialogs & opening links
     app.user = alice
     link1, link2 = db.get_link(l1), db.get_link(l2)
     for fn in (app.edit_link_dialog, app.share_friends_dialog, app.share_link_dialog, app.report_dialog,
@@ -112,10 +112,16 @@ async def main():
         app.cat_filter = f; page.route = "/links"; await app.render()
     app.open_browser_button(link2).on_click()        # warning dialog for caution links
     assert page.dialogs; page.dialogs.clear()
-    app.show_viewer(link1); assert page.appbar is None   # embeddable -> WebView
-    app.show_viewer(link2)                                # not embeddable -> fallback
+    # tapping a link opens it in the browser: safe -> client-side OpenUrl, caution -> warning first
+    safe_row = app.link_card(link1)
+    taps = [c for c in [safe_row.content.controls[0]] if getattr(c, "action", None)]
+    assert taps and taps[0].action.url == link1["final_url"], "safe link must open via OpenUrl"
+    warn_row = app.link_card(link2)
+    warn_row.content.controls[0].on_click()
+    assert page.dialogs and page.dialogs[-1].actions[1].action.url == link2["final_url"]
+    page.dialogs.clear()
     await app.save_copy(db.get_link(l3))
-    print("ok  dialogs + viewer")
+    print("ok  dialogs + links open in browser")
     print("ALL ROUTES RENDERED")
 
 
