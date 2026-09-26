@@ -25,6 +25,8 @@ THEME_MODES = {"system": (ft.Icons.BRIGHTNESS_AUTO, "Theme: follow system"),
                "light": (ft.Icons.LIGHT_MODE, "Theme: light"),
                "dark": (ft.Icons.DARK_MODE, "Theme: dark")}
 MAX_TITLE, MAX_NOTE = 200, 1000
+PAGE_SIZE = 100            # links shown before "Show more"
+NEW_CATEGORY = "__new__"   # dropdown sentinel
 
 VISIBILITY = {
     "private": ("Only me", ft.Icons.LOCK),
@@ -67,6 +69,10 @@ class App:
         self.token: Optional[str] = None
         self.prefs = ft.SharedPreferences()
         self.theme_choice = "system"
+        self.cat_filter = None        # My links: None = all, "none" = uncategorized, int = category
+        self.profile_filter = (None, None)   # (username, category)
+        self.limit = PAGE_SIZE
+        self.show_details = False
         self.c = palette.LIGHT
         self._closed = False
         # Invisible control whose value changes every 20 s. Each change is a tiny message
@@ -82,7 +88,7 @@ class App:
         p.theme = palette.make_theme(palette.LIGHT, dark=False)
         p.dark_theme = palette.make_theme(palette.DARK, dark=True)
         p.on_platform_brightness_change = self._on_route_change
-        p.padding = ft.Padding.symmetric(horizontal=12, vertical=16)
+        p.padding = ft.Padding.symmetric(horizontal=10, vertical=8)
         p.scroll = ft.ScrollMode.AUTO
         p.on_route_change = self._on_route_change
         p.on_close = self._on_close
@@ -113,6 +119,7 @@ class App:
                 pass  # disconnected: Flet drops updates until the client reconnects
 
     async def _on_route_change(self, e):
+        self.limit = PAGE_SIZE
         await self.render()
 
     def act(self, fn: Callable[..., Awaitable], *args, **kwargs):
@@ -260,15 +267,16 @@ class App:
                 ],
             ))
         return ft.AppBar(
-            leading=ft.Icon(ft.Icons.BOOKMARK, color=self.c["ribbon"], size=26), leading_width=44,
-            title=ft.Text(APP_NAME, font_family=DISPLAY, size=24, color=self.c["ink"]),
+            leading=ft.Icon(ft.Icons.BOOKMARK, color=self.c["ribbon"], size=24), leading_width=40,
+            toolbar_height=50,
+            title=ft.Text(APP_NAME, font_family=DISPLAY, size=22, color=self.c["ink"]),
             actions=actions, bgcolor=self.c["canvas"], elevation=0, elevation_on_scroll=0,
         )
 
     def _frame(self, controls: list[ft.Control]) -> ft.Control:
         """Centered column, full width on phones, ~2/3 width on desktop."""
         return ft.ResponsiveRow(
-            [ft.Column(controls, spacing=14, col={"xs": 12, "md": 10, "lg": 8, "xl": 7})],
+            [ft.Column(controls, spacing=10, col={"xs": 12, "md": 11, "lg": 9, "xl": 8})],
             alignment=ft.MainAxisAlignment.CENTER,
         )
 
@@ -329,10 +337,10 @@ class App:
 
     # ================================================================== reusable pieces
     def heading(self, text: str, sub: str = "") -> ft.Control:
-        items = [ft.Text(text, size=32, font_family=DISPLAY, color=self.c["ink"])]
+        items = [ft.Text(text, size=26, font_family=DISPLAY, color=self.c["ink"])]
         if sub:
-            items.append(ft.Text(sub, size=15, color=self.c["muted"]))
-        return ft.Container(ft.Column(items, spacing=2), padding=ft.Padding.only(top=4, bottom=4))
+            items.append(ft.Text(sub, size=13, color=self.c["muted"]))
+        return ft.Column(items, spacing=0)
 
     def empty(self, text: str, icon=ft.Icons.BOOKMARK_OUTLINE) -> ft.Control:
         return ft.Container(
@@ -345,7 +353,7 @@ class App:
 
     def card(self, controls: list[ft.Control]) -> ft.Control:
         return ft.Container(
-            ft.Column(controls, spacing=10), padding=16, bgcolor=self.c["surface"],
+            ft.Column(controls, spacing=8), padding=12, bgcolor=self.c["surface"],
             border=ft.Border.all(1, self.c["line"]), border_radius=14,
         )
 
@@ -361,29 +369,23 @@ class App:
             ),
         )
 
-    def status_chip(self, link: dict) -> ft.Control:
+    async def show_status(self, link: dict):
         label, icon, key = STATUS[link["status"]]
-        color, tint = self.c[key], self.c[key + "_bg"]
+        if link["reasons"]:
+            await self.alert(f"Safety check: {label}", link["reasons"], icon, self.c[key])
+        else:
+            await self.alert("Safety check passed", [
+                "Valid public web address, not on our blocklist.",
+                "Domain resolves to a public server.",
+                "Redirects (if any) were checked.",
+                f"Last checked {time_ago(link['checked_at'])}.",
+            ], icon, self.c[key])
 
-        async def show():
-            if link["reasons"]:
-                await self.alert(f"Safety check: {label}", link["reasons"], icon, color)
-            else:
-                await self.alert("Safety check passed", [
-                    "Valid public web address, not on our blocklist.",
-                    "Domain resolves to a public server.",
-                    "Redirects (if any) were checked.",
-                    f"Last checked {time_ago(link['checked_at'])}.",
-                ], icon, color)
-
-        return ft.Container(
-            content=ft.Row([ft.Icon(icon, size=15, color=color),
-                            ft.Text(label, size=12, color=color, font_family=STRONG)],
-                           spacing=4, tight=True),
-            padding=ft.Padding.symmetric(horizontal=9, vertical=4),
-            bgcolor=tint, border_radius=20,
-            on_click=show, ink=True, tooltip="Why?",
-        )
+    def status_icon(self, link: dict) -> ft.Control:
+        label, icon, key = STATUS[link["status"]]
+        return ft.IconButton(icon, icon_color=self.c[key], icon_size=18, tooltip=f"Safety: {label}",
+                             visual_density=ft.VisualDensity.COMPACT,
+                             on_click=self.act(self.show_status, link))
 
     def small_chip(self, text: str, icon, on_click=None, icon_color=None) -> ft.Control:
         return ft.Container(
@@ -399,7 +401,8 @@ class App:
         url = link["final_url"]
         if link["status"] == security.SAFE:
             if compact:
-                return ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser",
+                return ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser", icon_size=18,
+                                     visual_density=ft.VisualDensity.COMPACT,
                                      action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK))
             return ft.OutlinedButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW,
                                      action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK))
@@ -422,16 +425,20 @@ class App:
             ))
 
         if compact:
-            return ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser", on_click=warn_first)
+            return ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser", icon_size=18,
+                                 visual_density=ft.VisualDensity.COMPACT, on_click=warn_first)
         return ft.OutlinedButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW, on_click=warn_first)
 
     def copy_button(self, text: str, tooltip="Copy link") -> ft.Control:
-        return ft.IconButton(ft.Icons.CONTENT_COPY, tooltip=tooltip,
+        return ft.IconButton(ft.Icons.CONTENT_COPY, tooltip=tooltip, icon_size=17,
+                             visual_density=ft.VisualDensity.COMPACT,
                              action=ft.CopyToClipboard(text),
                              on_click=lambda: self.snack("Copied to clipboard"))
 
     def link_card(self, link: dict, sender: Optional[str] = None,
-                  in_inbox: bool = False, show_owner: bool = True) -> ft.Control:
+                  in_inbox: bool = False, show_owner: bool = True, last: bool = True) -> ft.Control:
+        """One compact row: ribbon | title + meta (tap to view) | safety, open, copy, menu."""
+        c = self.c
         mine = bool(self.user and link["owner_id"] == self.user["id"])
         title = link["title"] or security.display_domain(link["domain"])
         blocked = link["status"] == security.BLOCKED
@@ -439,8 +446,10 @@ class App:
         menu_items: list[ft.PopupMenuItem] = []
         if mine:
             menu_items += [
-                ft.PopupMenuItem(content="Edit / visibility", icon=ft.Icons.EDIT,
+                ft.PopupMenuItem(content="Edit", icon=ft.Icons.EDIT,
                                  on_click=self.act(self.edit_link_dialog, link)),
+                ft.PopupMenuItem(content="Move to category", icon=ft.Icons.DRIVE_FILE_MOVE_OUTLINE,
+                                 on_click=self.act(self.move_dialog, link)),
                 ft.PopupMenuItem(content="Share with friends", icon=ft.Icons.SEND,
                                  on_click=self.act(self.share_friends_dialog, link)),
                 ft.PopupMenuItem(content="Get share link (no login needed)", icon=ft.Icons.LINK,
@@ -463,50 +472,75 @@ class App:
                 content="Report", icon=ft.Icons.FLAG_OUTLINED,
                 on_click=self.act(self.report_dialog, link)))
 
-        chips = [self.status_chip(link)]
-        if mine:
-            vis_label, vis_icon = VISIBILITY[link["visibility"]]
-            chips.append(self.small_chip(vis_label, vis_icon, on_click=self.act(self.edit_link_dialog, link),
-                                         icon_color=self.c["vis_" + link["visibility"]]))
-        elif show_owner and link.get("owner_name"):
-            chips.append(self.small_chip(f"@{link['owner_name']}", ft.Icons.PERSON,
-                                         on_click=self.act(self.go, f"/u/{link['owner_name']}")))
-        if sender:
-            chips.append(self.small_chip(f"from @{sender}", ft.Icons.SEND))
+        def meta_text(text, color=None, icon=None, on_click=None):
+            parts = []
+            if icon:
+                parts.append(ft.Icon(icon, size=13, color=color or c["muted"]))
+            parts.append(ft.Text(text, size=12, color=color or c["muted"], max_lines=1,
+                                 overflow=ft.TextOverflow.ELLIPSIS))
+            row = ft.Row(parts, spacing=3, tight=True)
+            return ft.Container(row, on_click=on_click, ink=on_click is not None) if on_click else row
 
-        body = [
-            ft.Row([
-                ft.Column([
-                    ft.Text(title, font_family=STRONG, size=16, max_lines=2,
-                            overflow=ft.TextOverflow.ELLIPSIS, color=self.c["ink"]),
-                    ft.Row([
-                        ft.Text(security.display_domain(link["domain"]), size=13, color=self.c["primary"],
-                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Text(time_ago(link["created_at"]), size=12, color=self.c["muted"]),
-                    ], spacing=10),
-                ], spacing=2, expand=True),
-                ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, items=menu_items),
-            ], vertical_alignment=ft.CrossAxisAlignment.START),
+        meta = [meta_text(security.display_domain(link["domain"]), c["primary"])]
+        if link.get("category_name"):
+            meta.append(meta_text(link["category_name"], icon=ft.Icons.FOLDER_OUTLINED,
+                                  on_click=self.act(self.filter_to, link["category_id"]) if mine else None))
+        if not mine and show_owner and link.get("owner_name"):
+            meta.append(meta_text(f"@{link['owner_name']}", icon=ft.Icons.PERSON_OUTLINE,
+                                  on_click=self.act(self.go, f"/u/{link['owner_name']}")))
+        if sender:
+            meta.append(meta_text(f"from @{sender}", icon=ft.Icons.SEND))
+        meta.append(meta_text(time_ago(link["created_at"])))
+
+        text_col = [
+            ft.Text(title, font_family=STRONG, size=14, max_lines=1,
+                    overflow=ft.TextOverflow.ELLIPSIS, color=c["ink"]),
+            ft.Row(meta, spacing=10, wrap=True, run_spacing=0),
         ]
         if link["note"]:
-            body.append(ft.Text(link["note"], selectable=True, color=self.c["ink"]))
-        body.append(ft.Row(chips, wrap=True, spacing=6, run_spacing=6))
-        if not blocked:
-            body.append(ft.Row([
-                ft.TextButton("View", icon=ft.Icons.VISIBILITY, on_click=self.act(self.view_link, link)),
-                self.open_browser_button(link),
-                self.copy_button(link["final_url"]),
-            ], spacing=0))
-        return self.ribbon_card(body, self.c["vis_" + link["visibility"]])
+            text_col.append(ft.Text(link["note"], size=12, color=c["muted"], max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS, tooltip=link["note"][:300]))
 
-    def link_list(self, links: list[dict], empty_text: str, **card_kwargs) -> ft.Control:
+        main = ft.Container(
+            ft.Column(text_col, spacing=1), expand=True,
+            padding=ft.Padding.symmetric(vertical=7),
+            on_click=None if blocked else self.act(self.view_link, link),
+            tooltip=None if blocked else "View in the app",
+        )
+        actions = [self.status_icon(link)]
+        if not blocked:
+            actions += [self.open_browser_button(link), self.copy_button(link["final_url"])]
+        actions.append(ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, icon_size=18, items=menu_items))
+
+        return ft.Container(
+            ft.Row([main, *actions], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=ft.Padding.only(left=12, right=2),
+            border=ft.Border(left=ft.BorderSide(4, c["vis_" + link["visibility"]]),
+                             bottom=None if last else ft.BorderSide(1, c["line"])),
+        )
+
+    def link_list(self, links: list[dict], empty_text: str, total: Optional[int] = None,
+                  **card_kwargs) -> ft.Control:
+        """Links as one outlined list with hairline separators; paged by PAGE_SIZE."""
         if not links:
             return self.empty(empty_text)
-        return ft.Column([self.link_card(l, **card_kwargs) for l in links], spacing=8)
+        shown = links[: self.limit]
+        rows = [self.link_card(l, last=(i == len(shown) - 1), **card_kwargs) for i, l in enumerate(shown)]
+        out = [ft.Container(
+            ft.Column(rows, spacing=0), bgcolor=self.c["surface"], border_radius=12,
+            border=ft.Border.all(1, self.c["line"]), clip_behavior=ft.ClipBehavior.ANTI_ALIAS)]
+        remaining = (total if total is not None else len(links)) - len(shown)
+        if remaining > 0:
+            async def more():
+                self.limit += PAGE_SIZE
+                await self.render()
+            out.append(ft.Row([ft.TextButton(f"Show more ({remaining})", icon=ft.Icons.EXPAND_MORE,
+                                             on_click=more)], alignment=ft.MainAxisAlignment.CENTER))
+        return ft.Column(out, spacing=6)
 
     def visibility_dropdown(self, value: str, allow_unlisted: bool = True) -> ft.Dropdown:
         return ft.Dropdown(
-            label="Who can see it", value=value, width=260,
+            label="Who can see it", value=value, width=260, dense=True,
             options=[ft.DropdownOption(key=k, text=v[0],
                                        leading_icon=ft.Icon(ft.Icons.BOOKMARK, color=self.c["vis_" + k]))
                      for k, v in VISIBILITY.items()
@@ -514,6 +548,175 @@ class App:
         )
 
     # ================================================================== link actions
+    # ------------------------------------------------------------------ categories
+    def category_dropdown(self, value, label="Category", on_new=None, width=None) -> ft.Dropdown:
+        cats = db.list_categories(self.user["id"])
+        dd = ft.Dropdown(
+            label=label, dense=True, width=width, value=str(value) if value else "",
+            leading_icon=ft.Icons.FOLDER_OUTLINED,
+            options=[ft.DropdownOption(key="", text="No category")]
+            + [ft.DropdownOption(key=str(cat["id"]), text=cat["name"]) for cat in cats]
+            + [ft.DropdownOption(key=NEW_CATEGORY, text="New category...")],
+        )
+
+        async def selected(e=None):
+            if dd.value == NEW_CATEGORY:
+                cid = await self.ask_new_category()
+                if cid:
+                    dd.options.insert(len(dd.options) - 1, ft.DropdownOption(
+                        key=str(cid), text=db.get_category_name(cid) or "New"))
+                dd.value = str(cid) if cid else ""
+                self.page.update()
+                if on_new:
+                    await on_new(cid)
+
+        dd.on_select = selected
+        return dd
+
+    @staticmethod
+    def dropdown_category(dd: ft.Dropdown) -> Optional[int]:
+        return int(dd.value) if dd.value and dd.value.isdigit() else None
+
+    async def ask_new_category(self) -> Optional[int]:
+        """Small modal that returns the new (or existing same-name) category id."""
+        done = asyncio.get_running_loop().create_future()
+        name = ft.TextField(label="Category name", autofocus=True, max_length=db.MAX_CATEGORY_NAME)
+        error = ft.Text(color=self.c["blocked"], visible=False, size=12)
+
+        def finish(value):
+            if not done.done():
+                done.set_result(value)
+            self.page.pop_dialog()
+
+        def create():
+            try:
+                finish(db.create_category(self.user["id"], name.value or ""))
+            except ValueError as e:
+                error.value, error.visible = str(e), True
+                self.page.update()
+
+        name.on_submit = create
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("New category"),
+            content=ft.Column([name, error], tight=True, width=360),
+            actions=[ft.TextButton("Cancel", on_click=lambda: finish(None)),
+                     ft.FilledButton("Create", on_click=create)],
+        ))
+        return await done
+
+    async def filter_to(self, category):
+        self.cat_filter = category
+        self.limit = PAGE_SIZE
+        await self.go("/links")
+
+    async def move_dialog(self, link: dict):
+        dd = self.category_dropdown(link.get("category_id"), label="Move to")
+
+        async def save():
+            db.set_link_category(link["id"], self.user["id"], self.dropdown_category(dd))
+            self.close_dialog()
+            self.snack("Moved")
+            await self.render()
+
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text("Move to category"),
+            content=ft.Column([ft.Text(link["title"] or link["domain"], color=self.c["muted"], max_lines=2),
+                               dd], tight=True, width=360),
+            actions=[ft.TextButton("Cancel", on_click=self.close_dialog),
+                     ft.FilledButton("Move", on_click=save)],
+        ))
+
+    async def manage_categories_dialog(self):
+        uid = self.user["id"]
+        body = ft.Column(tight=True, spacing=4, scroll=ft.ScrollMode.AUTO, width=420)
+        new_name = ft.TextField(label="New category", dense=True, expand=True,
+                                max_length=db.MAX_CATEGORY_NAME)
+
+        def rebuild(message: str = ""):
+            rows = []
+            for cat in db.list_categories(uid):
+                field = ft.TextField(value=cat["name"], dense=True, expand=True,
+                                     max_length=db.MAX_CATEGORY_NAME, counter=None)
+
+                def rename(cat=cat, field=field):
+                    try:
+                        db.rename_category(uid, cat["id"], field.value or "")
+                        rebuild("Renamed")
+                    except ValueError as e:
+                        rebuild(str(e))
+
+                async def remove(cat=cat):
+                    if await self.confirm(f"Delete \"{cat['name']}\"?",
+                                          [f"Its {cat['n']} link(s) will be kept and become uncategorized."],
+                                          ok_text="Delete", danger=True):
+                        db.delete_category(uid, cat["id"])
+                        if self.cat_filter == cat["id"]:
+                            self.cat_filter = None
+                    await self.manage_categories_dialog()
+
+                field.on_submit = rename
+                rows.append(ft.Row([
+                    field, ft.Text(str(cat["n"]), size=12, color=self.c["muted"], width=28),
+                    ft.IconButton(ft.Icons.CHECK, tooltip="Save name", on_click=rename,
+                                  visual_density=ft.VisualDensity.COMPACT),
+                    ft.IconButton(ft.Icons.DELETE_OUTLINE, tooltip="Delete category",
+                                  on_click=remove, visual_density=ft.VisualDensity.COMPACT),
+                ], spacing=2))
+            if not rows:
+                rows.append(ft.Text("No categories yet.", color=self.c["muted"]))
+            if message:
+                rows.append(ft.Text(message, size=12, color=self.c["muted"]))
+            body.controls = rows
+            self.page.update()
+
+        def add():
+            try:
+                db.create_category(uid, new_name.value or "")
+                new_name.value = ""
+                rebuild()
+            except ValueError as e:
+                rebuild(str(e))
+
+        async def close():
+            self.close_dialog()
+            await self.render()
+
+        new_name.on_submit = add
+        rebuild()
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text("Categories"),
+            content=ft.Column([body, ft.Divider(height=8),
+                               ft.Row([new_name, ft.FilledButton("Add", on_click=add)])],
+                              tight=True, width=420),
+            actions=[ft.TextButton("Done", on_click=close)],
+        ))
+
+    def category_bar(self, cats: list[dict], selected, on_pick, total: int,
+                     uncategorized: Optional[int] = None, manage: bool = False) -> ft.Control:
+        """Horizontally scrolling filter chips: All, each category, Uncategorized."""
+        c = self.c
+
+        def chip(label, n, value, icon=None):
+            is_sel = selected == value
+            return ft.Chip(
+                label=ft.Text(f"{label}  {n}", size=13,
+                              color=c["on_primary"] if is_sel else c["ink"]),
+                leading=ft.Icon(icon, size=15, color=c["on_primary"] if is_sel else c["muted"]) if icon else None,
+                selected=is_sel, show_checkmark=False, selected_color=c["primary"],
+                bgcolor=c["surface"], border_side=ft.BorderSide(1, c["primary"] if is_sel else c["line"]),
+                visual_density=ft.VisualDensity.COMPACT,
+                on_click=self.act(on_pick, value),
+            )
+
+        chips = [chip("All", total, None)]
+        chips += [chip(cat["name"], cat["n"], cat["id"], ft.Icons.FOLDER_OUTLINED) for cat in cats]
+        if uncategorized:
+            chips.append(chip("Uncategorized", uncategorized, "none", ft.Icons.FOLDER_OFF_OUTLINED))
+        if manage:
+            chips.append(ft.IconButton(ft.Icons.CREATE_NEW_FOLDER_OUTLINED, tooltip="Manage categories",
+                                       icon_size=20, on_click=self.act(self.manage_categories_dialog)))
+        return ft.Row(chips, spacing=6, scroll=ft.ScrollMode.AUTO)
+
     async def run_scan(self, raw: str, button: ft.Control, ring: ft.ProgressRing,
                        action_text: str) -> Optional[security.ScanResult]:
         button.disabled, ring.visible = True, True
@@ -602,6 +805,7 @@ class App:
         note = ft.TextField(label="Note", value=link["note"], multiline=True, min_lines=2,
                             max_lines=5, max_length=MAX_NOTE)
         vis = self.visibility_dropdown(link["visibility"])
+        cat = self.category_dropdown(link.get("category_id"), width=260)
 
         async def save():
             if vis.value == "public" and link["status"] != security.SAFE:
@@ -609,13 +813,14 @@ class App:
                 return
             db.update_link(link["id"], title=(title.value or "").strip()[:MAX_TITLE],
                            note=(note.value or "").strip()[:MAX_NOTE], visibility=vis.value)
+            db.set_link_category(link["id"], self.user["id"], self.dropdown_category(cat))
             self.close_dialog()
             self.snack("Saved")
             await self.render()
 
         self.page.show_dialog(ft.AlertDialog(
             title=ft.Text("Edit link"),
-            content=ft.Column([title, note, vis], tight=True, width=420),
+            content=ft.Column([title, note, cat, vis], tight=True, width=420),
             actions=[ft.TextButton("Cancel", on_click=self.close_dialog), ft.FilledButton("Save", on_click=save)],
         ))
 
@@ -695,7 +900,8 @@ class App:
         db.add_link(self.user["id"], scan_from_link(link) if link["reasons"] else
                     security.ScanResult(url=link["url"], final_url=link["final_url"],
                                         domain=link["domain"], embeddable=bool(link["embeddable"])),
-                    link["title"], "", "private")
+                    link["title"], "", "private",
+                    category_id=db.suggest_category(self.user["id"], link["domain"]))
         self.snack("Saved to your links (only you can see it)")
 
     async def remove_from_inbox(self, link: dict):
@@ -869,66 +1075,120 @@ class App:
         ]
 
     def view_links(self) -> list[ft.Control]:
-        url = ft.TextField(label="Link", hint_text="Paste a web address...", prefix_icon=ft.Icons.LINK,
-                           autofocus=True, autocorrect=False, keyboard_type=ft.KeyboardType.URL)
-        title = ft.TextField(label="Title (optional - we'll fetch it)", max_length=MAX_TITLE, expand=True)
-        note = ft.TextField(label="Note (optional)", multiline=True, max_lines=3, max_length=MAX_NOTE)
+        uid = self.user["id"]
+        c = self.c
+        cats = db.list_categories(uid)
+        if self.cat_filter not in (None, "none") and self.cat_filter not in {x["id"] for x in cats}:
+            self.cat_filter = None      # category was deleted
+
+        url = ft.TextField(label="Link", hint_text="Paste a web address and press Enter",
+                           prefix_icon=ft.Icons.LINK, dense=True, autofocus=True, autocorrect=False,
+                           keyboard_type=ft.KeyboardType.URL)
+        category = self.category_dropdown(self.cat_filter if isinstance(self.cat_filter, int) else None)
+        category.col = {"xs": 6, "md": 3}
         vis = self.visibility_dropdown("private", allow_unlisted=False)
-        ring = ft.ProgressRing(width=20, height=20, visible=False)
-        save_btn = ft.FilledButton("Check & save", icon=ft.Icons.BOOKMARK_ADD)
-        search = ft.TextField(hint_text="Search your links", prefix_icon=ft.Icons.SEARCH, dense=True)
-        results = ft.Column()
+        vis.width, vis.col = None, {"xs": 6, "md": 3}
+        url.col = {"xs": 12, "md": 6}
+        title = ft.TextField(label="Title (optional, fetched automatically)", dense=True,
+                             max_length=MAX_TITLE, counter=None)
+        note = ft.TextField(label="Note (optional)", dense=True, multiline=True, max_lines=3,
+                            max_length=MAX_NOTE)
+        details = ft.Column([title, note], spacing=6, visible=self.show_details)
+        ring = ft.ProgressRing(width=18, height=18, stroke_width=2, visible=False)
+        save_btn = ft.FilledButton("Save link", icon=ft.Icons.BOOKMARK_ADD)
+        toggle = ft.TextButton("Hide title and note" if self.show_details else "Add title and note",
+                               icon=ft.Icons.EXPAND_LESS if self.show_details else ft.Icons.EXPAND_MORE)
+
+        def flip():
+            self.show_details = details.visible = not details.visible
+            toggle.content = "Hide title and note" if details.visible else "Add title and note"
+            toggle.icon = ft.Icons.EXPAND_LESS if details.visible else ft.Icons.EXPAND_MORE
+            self.page.update()
+
+        toggle.on_click = flip
+        search = ft.TextField(hint_text="Search", prefix_icon=ft.Icons.SEARCH, dense=True,
+                              col={"xs": 12, "md": 5})
+        results = ft.Column(spacing=0)
 
         def refresh_list():
-            results.controls = [self.link_list(db.list_user_links(self.user["id"], search.value or ""),
-                                               "No links yet. Paste one above to get started."
-                                               if not search.value else "Nothing matches your search.")]
+            q = search.value or ""
+            links = db.list_user_links(uid, q, self.cat_filter, limit=self.limit)
+            empty = ("Nothing matches your search." if q else
+                     "No links in this category yet." if self.cat_filter is not None else
+                     "No links yet. Paste one above to get started.")
+            results.controls = [self.link_list(links, empty,
+                                               total=db.count_user_links(uid, q, self.cat_filter))]
 
         async def save():
             if not (url.value or "").strip():
                 return
-            if not ratelimit.allow("add_link", str(self.user["id"])):
+            if not ratelimit.allow("add_link", str(uid)):
                 self.snack("You're adding links too fast. Try again later.", error=True)
                 return
             result = await self.run_scan(url.value, save_btn, ring, "saved")
             if not result:
                 return
-            if db.find_duplicate(self.user["id"], result.url, result.final_url):
+            if db.find_duplicate(uid, result.url, result.final_url):
                 self.snack("You've already saved this link.")
                 return
             visibility = vis.value
             if visibility == "public" and result.status != security.SAFE:
                 visibility = "private"
                 self.snack("Saved as private - only links that pass every check can be public.")
-            db.add_link(self.user["id"], result, (title.value or "").strip()[:MAX_TITLE] or result.title,
-                        (note.value or "").strip()[:MAX_NOTE], visibility)
+            cat_id = self.dropdown_category(category)
+            auto = cat_id is None and db.suggest_category(uid, result.domain)
+            db.add_link(uid, result, (title.value or "").strip()[:MAX_TITLE] or result.title,
+                        (note.value or "").strip()[:MAX_NOTE], visibility, category_id=cat_id or auto or None)
             url.value = title.value = note.value = ""
-            refresh_list()
-            self.snack("Link saved")
-            self.page.update()
+            if auto:
+                self.snack(f"Saved to {db.get_category_name(auto)} (where your other "
+                           f"{security.display_domain(result.domain)} links are)")
+            else:
+                self.snack("Link saved")
+            await self.render()
 
         save_btn.on_click = save
         url.on_submit = save
         search.on_change = lambda: (refresh_list(), self.page.update())
         refresh_list()
+
+        async def pick(value):
+            self.cat_filter = value
+            self.limit = PAGE_SIZE
+            await self.render()
+
+        all_count = sum(x["n"] for x in cats) + db.uncategorized_count(uid)
         return [
-            self.heading("My links"),
-            self.card([url, ft.Row([title]), note,
-                       ft.Row([vis, save_btn, ring], wrap=True,
-                              vertical_alignment=ft.CrossAxisAlignment.CENTER)]),
-            search,
+            ft.ResponsiveRow([
+                ft.Container(self.heading("My links"), col={"xs": 12, "md": 7}),
+                search,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER, run_spacing=6),
+            self.card([
+                ft.ResponsiveRow([url, category, vis], spacing=8, run_spacing=8),
+                details,
+                ft.Row([save_btn, ring, toggle], spacing=8, wrap=True,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ]),
+            self.category_bar(cats, self.cat_filter, pick, all_count,
+                              uncategorized=db.uncategorized_count(uid), manage=True),
             results,
         ]
 
     def view_shared(self) -> list[ft.Control]:
         links = db.list_shared_with(self.user["id"])
         db.mark_shares_seen(self.user["id"])
-        cards = [self.link_card(l, sender=l["sender_name"], in_inbox=True, show_owner=False) for l in links]
+        if not links:
+            return [self.heading("Shared with me", "Links your friends sent you."),
+                    self.empty("Nothing shared with you yet.", ft.Icons.INBOX)]
+        rows = [self.link_card(l, sender=l["sender_name"], in_inbox=True, show_owner=False,
+                               last=i == len(links) - 1) for i, l in enumerate(links[: self.limit])]
         return [self.heading("Shared with me", "Links your friends sent you."),
-                ft.Column(cards, spacing=8) if cards else self.empty("Nothing shared with you yet.", ft.Icons.INBOX)]
+                ft.Container(ft.Column(rows, spacing=0), bgcolor=self.c["surface"], border_radius=12,
+                             border=ft.Border.all(1, self.c["line"]), clip_behavior=ft.ClipBehavior.ANTI_ALIAS)]
 
     def view_explore(self) -> list[ft.Control]:
-        search = ft.TextField(hint_text="Search public links", prefix_icon=ft.Icons.SEARCH, dense=True)
+        search = ft.TextField(hint_text="Search public links", prefix_icon=ft.Icons.SEARCH, dense=True,
+                              col={"xs": 12, "md": 5})
         results = ft.Column()
 
         def refresh():
@@ -937,7 +1197,10 @@ class App:
 
         search.on_change = lambda: (refresh(), self.page.update())
         refresh()
-        return [self.heading("Explore", "Links people have made public."), search, results]
+        return [ft.ResponsiveRow([ft.Container(self.heading("Explore", "Links people have made public."),
+                                               col={"xs": 12, "md": 7}), search],
+                                 vertical_alignment=ft.CrossAxisAlignment.CENTER, run_spacing=6),
+                results]
 
     def view_friends(self) -> list[ft.Control]:
         uid = self.user["id"]
@@ -1001,7 +1264,17 @@ class App:
         me = self.user
         is_self = bool(me and me["id"] == owner["id"])
         friends = bool(me and not is_self and db.are_friends(me["id"], owner["id"]))
-        links = db.list_profile_links(owner["id"], include_friends=friends or is_self)
+        see_friends = friends or is_self
+        if self.profile_filter[0] != owner["id"]:
+            self.profile_filter = (owner["id"], None)
+        selected = self.profile_filter[1]
+        cats = db.list_categories(owner["id"], visible_only=True, include_friends=see_friends)
+        links = db.list_profile_links(owner["id"], include_friends=see_friends, category=selected)
+        total = len(db.list_profile_links(owner["id"], include_friends=see_friends))
+
+        async def pick(value):
+            self.profile_filter = (owner["id"], value)
+            await self.render()
 
         action: Optional[ft.Control] = None
         if me and not is_self:
@@ -1029,6 +1302,7 @@ class App:
                     ft.Column([ft.Text(f"@{owner['username']}", size=30, font_family=DISPLAY, color=self.c["ink"]),
                                ft.Text(sub, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True)]
                    + ([action] if action else []), wrap=True),
+            self.category_bar(cats, selected, pick, total) if cats else ft.Container(),
             self.link_list(links, "No links to show.", show_owner=False),
         ]
 
@@ -1051,7 +1325,7 @@ class App:
                                 ft.Text("Our safety check found something unusual about this link. "
                                         "Tap 'Caution' below to see why.", expand=True,
                                         color=self.c["caution"])])))
-        out.append(self.link_card(share, show_owner=False))
+        out.append(self.link_list([share], "", show_owner=False))
         if share.get("expires_at"):
             out.append(ft.Text(f"This share link expires in {max(1, (share['expires_at'] - db.now()) // 86400)} days.",
                                size=12, color=ft.Colors.ON_SURFACE_VARIANT))

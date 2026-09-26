@@ -61,6 +61,7 @@ FONTS = {
 def make_theme(c: dict, dark: bool) -> ft.Theme:
     return ft.Theme(
         font_family=BODY,
+        visual_density=ft.VisualDensity.COMPACT,   # denser lists, fields and buttons
         color_scheme=ft.ColorScheme(
             primary=c["primary"], on_primary=c["on_primary"],
             primary_container=c["primary_soft"], on_primary_container=c["ink"],

@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS links (
 CREATE INDEX IF NOT EXISTS idx_links_owner  ON links(owner_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_links_public ON links(visibility, created_at DESC);
 
+-- per-user categories ("folders") for organising links
+CREATE TABLE IF NOT EXISTS categories (
+    id         INTEGER PRIMARY KEY,
+    owner_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (owner_id, name COLLATE NOCASE)
+);
+
 CREATE TABLE IF NOT EXISTS share_codes (
     code       TEXT PRIMARY KEY,
     link_id    INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
@@ -108,6 +117,16 @@ def init_db() -> None:
     with connect() as c:
         c.execute("PRAGMA journal_mode = WAL")
         c.executescript(SCHEMA)
+        _migrate(c)
+
+
+def _migrate(c: sqlite3.Connection) -> None:
+    """Upgrade databases created by earlier versions (safe to run every start)."""
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(links)").fetchall()}
+    if "category_id" not in cols:
+        c.execute("ALTER TABLE links ADD COLUMN category_id INTEGER "
+                  "REFERENCES categories(id) ON DELETE SET NULL")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_links_category ON links(owner_id, category_id)")
 
 
 def _dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
@@ -170,20 +189,121 @@ def delete_session(token_hash: str) -> None:
 LINK_FIELDS = ("url", "final_url", "domain", "title", "note", "visibility", "status",
                "reasons", "embeddable", "checked_at", "hidden", "admin_locked", "report_count")
 
-_LINK_SELECT = """SELECT l.*, u.username AS owner_name FROM links l
-                  LEFT JOIN users u ON u.id = l.owner_id"""
+_LINK_SELECT = """SELECT l.*, u.username AS owner_name, cat.name AS category_name FROM links l
+                  LEFT JOIN users u ON u.id = l.owner_id
+                  LEFT JOIN categories cat ON cat.id = l.category_id"""
+
+MAX_CATEGORIES = 60
+MAX_CATEGORY_NAME = 40
 
 
-def add_link(owner_id: Optional[int], scan, title: str, note: str, visibility: str) -> int:
+def _owned_category(c: sqlite3.Connection, owner_id: Optional[int], category_id) -> Optional[int]:
+    """Only accept a category that belongs to the link's owner."""
+    if not category_id or owner_id is None:
+        return None
+    row = c.execute("SELECT id FROM categories WHERE id = ? AND owner_id = ?",
+                    (category_id, owner_id)).fetchone()
+    return row["id"] if row else None
+
+
+def add_link(owner_id: Optional[int], scan, title: str, note: str, visibility: str,
+             category_id: Optional[int] = None) -> int:
     with connect() as c:
         cur = c.execute(
             """INSERT INTO links (owner_id, url, final_url, domain, title, note, visibility,
-                                  status, reasons, embeddable, checked_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  status, reasons, embeddable, checked_at, created_at, category_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (owner_id, scan.url, scan.final_url, scan.domain, title, note, visibility,
-             scan.status, json.dumps(scan.reasons), int(scan.embeddable), now(), now()),
+             scan.status, json.dumps(scan.reasons), int(scan.embeddable), now(), now(),
+             _owned_category(c, owner_id, category_id)),
         )
         return cur.lastrowid
+
+
+def set_link_category(link_id: int, owner_id: int, category_id: Optional[int]) -> None:
+    with connect() as c:
+        c.execute("UPDATE links SET category_id = ? WHERE id = ? AND owner_id = ?",
+                  (_owned_category(c, owner_id, category_id), link_id, owner_id))
+
+
+# ------------------------------------------------------------------ categories
+def clean_category_name(name: str) -> str:
+    return " ".join((name or "").split())[:MAX_CATEGORY_NAME]
+
+
+def list_categories(owner_id: int, visible_only: bool = False, include_friends: bool = False) -> list[dict]:
+    """Categories with link counts. visible_only = count only what profile visitors can see."""
+    vis_filter = ""
+    if visible_only:
+        vis = "('public', 'friends')" if include_friends else "('public')"
+        vis_filter = f"AND l.visibility IN {vis} AND l.status != 'blocked' AND l.hidden = 0"
+    with connect() as c:
+        rows = _dicts(c.execute(
+            f"""SELECT cat.id, cat.name, COUNT(l.id) AS n FROM categories cat
+                LEFT JOIN links l ON l.category_id = cat.id {vis_filter}
+                WHERE cat.owner_id = ? GROUP BY cat.id ORDER BY cat.name COLLATE NOCASE""",
+            (owner_id,),
+        ).fetchall())
+    return [r for r in rows if r["n"] > 0] if visible_only else rows
+
+
+def get_category_name(category_id: int) -> Optional[str]:
+    with connect() as c:
+        row = c.execute("SELECT name FROM categories WHERE id = ?", (category_id,)).fetchone()
+        return row["name"] if row else None
+
+
+def uncategorized_count(owner_id: int) -> int:
+    with connect() as c:
+        return c.execute("SELECT COUNT(*) FROM links WHERE owner_id = ? AND category_id IS NULL",
+                         (owner_id,)).fetchone()[0]
+
+
+def create_category(owner_id: int, name: str) -> int:
+    """Returns the id (existing one if the name is already used). Raises ValueError."""
+    name = clean_category_name(name)
+    if not name:
+        raise ValueError("Give the category a name.")
+    with connect() as c:
+        row = c.execute("SELECT id FROM categories WHERE owner_id = ? AND name = ? COLLATE NOCASE",
+                        (owner_id, name)).fetchone()
+        if row:
+            return row["id"]
+        if c.execute("SELECT COUNT(*) FROM categories WHERE owner_id = ?", (owner_id,)).fetchone()[0] >= MAX_CATEGORIES:
+            raise ValueError(f"You can have up to {MAX_CATEGORIES} categories.")
+        return c.execute("INSERT INTO categories (owner_id, name, created_at) VALUES (?, ?, ?)",
+                         (owner_id, name, now())).lastrowid
+
+
+def rename_category(owner_id: int, category_id: int, name: str) -> None:
+    name = clean_category_name(name)
+    if not name:
+        raise ValueError("Give the category a name.")
+    with connect() as c:
+        try:
+            c.execute("UPDATE categories SET name = ? WHERE id = ? AND owner_id = ?",
+                      (name, category_id, owner_id))
+        except sqlite3.IntegrityError:
+            raise ValueError("You already have a category with that name.")
+
+
+def delete_category(owner_id: int, category_id: int) -> None:
+    """Links in it become uncategorized (they are not deleted)."""
+    with connect() as c:
+        c.execute("UPDATE links SET category_id = NULL WHERE category_id = ? AND owner_id = ?",
+                  (category_id, owner_id))
+        c.execute("DELETE FROM categories WHERE id = ? AND owner_id = ?", (category_id, owner_id))
+
+
+def suggest_category(owner_id: int, domain: str) -> Optional[int]:
+    """The category most recently used for this domain, to pre-select when saving."""
+    with connect() as c:
+        row = c.execute(
+            """SELECT category_id FROM links WHERE owner_id = ? AND domain = ?
+               AND category_id IS NOT NULL ORDER BY created_at DESC LIMIT 1""",
+            (owner_id, domain),
+        ).fetchone()
+        return row["category_id"] if row else None
 
 
 def update_link(link_id: int, **fields) -> None:
@@ -228,12 +348,23 @@ def _search_clause(search: str) -> tuple[str, list]:
     return " AND (l.title LIKE ? OR l.note LIKE ? OR l.domain LIKE ? OR l.url LIKE ?)", [like] * 4
 
 
-def list_user_links(owner_id: int, search: str = "") -> list[dict]:
+def _category_clause(category) -> tuple[str, list]:
+    """category: None = all, "none" = uncategorized, int = that category."""
+    if category is None:
+        return "", []
+    if category == "none":
+        return " AND l.category_id IS NULL", []
+    return " AND l.category_id = ?", [int(category)]
+
+
+def list_user_links(owner_id: int, search: str = "", category=None,
+                    limit: int = 10_000) -> list[dict]:
     clause, args = _search_clause(search)
+    cclause, cargs = _category_clause(category)
     with connect() as c:
         return _dicts(c.execute(
-            f"{_LINK_SELECT} WHERE l.owner_id = ?{clause} ORDER BY l.created_at DESC",
-            (owner_id, *args),
+            f"{_LINK_SELECT} WHERE l.owner_id = ?{clause}{cclause} ORDER BY l.created_at DESC LIMIT ?",
+            (owner_id, *args, *cargs, limit),
         ).fetchall())
 
 
@@ -248,14 +379,23 @@ def list_public_links(search: str = "", limit: int = 100) -> list[dict]:
         ).fetchall())
 
 
-def list_profile_links(owner_id: int, include_friends: bool) -> list[dict]:
+def count_user_links(owner_id: int, search: str = "", category=None) -> int:
+    clause, args = _search_clause(search)
+    cclause, cargs = _category_clause(category)
+    with connect() as c:
+        return c.execute(f"SELECT COUNT(*) FROM links l WHERE l.owner_id = ?{clause}{cclause}",
+                         (owner_id, *args, *cargs)).fetchone()[0]
+
+
+def list_profile_links(owner_id: int, include_friends: bool, category=None) -> list[dict]:
     vis = ("public", "friends") if include_friends else ("public",)
     marks = ",".join("?" * len(vis))
+    cclause, cargs = _category_clause(category)
     with connect() as c:
         return _dicts(c.execute(
             f"""{_LINK_SELECT} WHERE l.owner_id = ? AND l.visibility IN ({marks})
-                AND l.status != 'blocked' AND l.hidden = 0 ORDER BY l.created_at DESC""",
-            (owner_id, *vis),
+                AND l.status != 'blocked' AND l.hidden = 0{cclause} ORDER BY l.created_at DESC""",
+            (owner_id, *vis, *cargs),
         ).fetchall())
 
 
@@ -288,7 +428,7 @@ def share_with(link_id: int, sender_id: int, recipient_ids: list[int]) -> int:
 def list_shared_with(user_id: int) -> list[dict]:
     with connect() as c:
         return _dicts(c.execute(
-            """SELECT l.*, o.username AS owner_name, s.username AS sender_name,
+            """SELECT l.*, o.username AS owner_name, s.username AS sender_name, NULL AS category_name,
                       ls.seen, ls.created_at AS shared_at
                FROM link_shares ls
                JOIN links l ON l.id = ls.link_id
@@ -348,7 +488,7 @@ def get_share(code: str) -> Optional[dict]:
     with connect() as c:
         row = c.execute(
             """SELECT sc.code, sc.expires_at, sc.views, cb.username AS shared_by, l.*,
-                      o.username AS owner_name
+                      o.username AS owner_name, NULL AS category_name
                FROM share_codes sc
                JOIN links l ON l.id = sc.link_id
                LEFT JOIN users cb ON cb.id = sc.created_by
