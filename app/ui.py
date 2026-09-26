@@ -7,7 +7,6 @@ from typing import Awaitable, Callable, Optional
 from urllib.parse import parse_qs, quote, urlsplit
 
 import flet as ft
-import flet_webview as fwv
 
 import auth
 import db
@@ -397,37 +396,49 @@ class App:
             on_click=on_click, ink=on_click is not None,
         )
 
-    def open_browser_button(self, link: dict, compact: bool = True) -> ft.Control:
+    def warn_before_open(self, link: dict):
+        """Caution links: show why first; the real open happens from the dialog's button."""
         url = link["final_url"]
-        if link["status"] == security.SAFE:
-            if compact:
-                return ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser", icon_size=18,
-                                     visual_density=ft.VisualDensity.COMPACT,
-                                     action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK))
-            return ft.OutlinedButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW,
-                                     action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK))
+        self.page.show_dialog(ft.AlertDialog(
+            icon=ft.Icon(ft.Icons.GPP_MAYBE, color=self.c["caution"]),
+            title=ft.Text("Proceed with caution"),
+            content=ft.Column(
+                [ft.Text(f"• {r}") for r in link["reasons"]]
+                + [ft.Text(url, size=12, selectable=True, color=self.c["muted"])],
+                tight=True, spacing=6),
+            actions=[
+                ft.TextButton("Cancel", on_click=self.close_dialog),
+                ft.FilledButton("Open anyway", icon=ft.Icons.OPEN_IN_NEW,
+                                action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK),
+                                on_click=self.close_dialog),
+            ],
+        ))
 
-        # Caution links: show the warning first; the real "open" button lives in the dialog
-        def warn_first():
-            self.page.show_dialog(ft.AlertDialog(
-                icon=ft.Icon(ft.Icons.GPP_MAYBE, color=self.c["caution"]),
-                title=ft.Text("Proceed with caution"),
-                content=ft.Column(
-                    [ft.Text(f"• {r}") for r in link["reasons"]]
-                    + [ft.Text(url, size=12, selectable=True, color=self.c["muted"])],
-                    tight=True, spacing=6),
-                actions=[
-                    ft.TextButton("Cancel", on_click=self.close_dialog),
-                    ft.FilledButton("Open anyway", icon=ft.Icons.OPEN_IN_NEW,
-                              action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK),
-                              on_click=self.close_dialog),
-                ],
-            ))
+    def opens_link(self, control: ft.Control, link: dict) -> ft.Control:
+        """
+        Make `control` open the link in a new browser tab.
 
-        if compact:
-            return ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser", icon_size=18,
-                                 visual_density=ft.VisualDensity.COMPACT, on_click=warn_first)
-        return ft.OutlinedButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW, on_click=warn_first)
+        Safe links use a client action: the browser opens the tab inside the click itself,
+        so pop-up blockers (and iOS Safari) allow it and there is no server round trip.
+        """
+        if link["status"] == security.SAFE and link.get("final_url"):
+            control.action = ft.OpenUrl(link["final_url"], target=ft.UrlTarget.BLANK)
+        elif link["status"] == security.WARN and link.get("final_url"):
+            control.on_click = lambda: self.warn_before_open(link)
+        else:  # blocked: never open, but say why instead of doing nothing
+            control.on_click = self.act(
+                self.alert, "This link is blocked",
+                link["reasons"] or ["It failed the safety check."], ft.Icons.GPP_BAD, self.c["blocked"])
+        return control
+
+    def open_url_button(self, url: str, label: str = "Open") -> ft.Control:
+        """For URLs we generated ourselves (share links) - always safe to open."""
+        return ft.OutlinedButton(label, icon=ft.Icons.OPEN_IN_NEW,
+                                 action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK))
+
+    def open_browser_button(self, link: dict) -> ft.Control:
+        return self.opens_link(
+            ft.FilledButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW), link)
 
     def copy_button(self, text: str, tooltip="Copy link") -> ft.Control:
         return ft.IconButton(ft.Icons.CONTENT_COPY, tooltip=tooltip, icon_size=17,
@@ -502,14 +513,15 @@ class App:
                                     overflow=ft.TextOverflow.ELLIPSIS, tooltip=link["note"][:300]))
 
         main = ft.Container(
-            ft.Column(text_col, spacing=1), expand=True,
+            ft.Column(text_col, spacing=1), expand=True, ink=True,
             padding=ft.Padding.symmetric(vertical=7),
-            on_click=None if blocked else self.act(self.view_link, link),
-            tooltip=None if blocked else "View in the app",
+            tooltip="Blocked - tap to see why" if blocked
+            else f"Open {security.display_domain(link['domain'])} in a new tab",
         )
+        self.opens_link(main, link)
         actions = [self.status_icon(link)]
         if not blocked:
-            actions += [self.open_browser_button(link), self.copy_button(link["final_url"])]
+            actions.append(self.copy_button(link["final_url"]))
         actions.append(ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, icon_size=18, items=menu_items))
 
         return ft.Container(
@@ -740,65 +752,13 @@ class App:
                 return None
         return result
 
-    async def view_link(self, link: dict):
-        link = await self.ensure_fresh(link)
-        if link["status"] == security.BLOCKED:
-            await self.alert("This link has been blocked", link["reasons"], ft.Icons.GPP_BAD, self.c["blocked"])
-            return
-        if link["status"] == security.WARN:
-            if not await self.confirm("Proceed with caution", [f"• {r}" for r in link["reasons"]],
-                                      ok_text="View anyway"):
-                return
-        self.show_viewer(link)
-
     async def ensure_fresh(self, link: dict) -> dict:
-        """Re-scan links that haven't been checked recently (sites can turn bad later)."""
+        """Re-scan a link that hasn't been checked recently (used by share pages)."""
         if link.get("admin_locked") or db.now() - link["checked_at"] < RESCAN_HOURS * 3600:
             return link
         result = await security.scan_url(link["url"])
         db.apply_scan(link["id"], result)
         return {**link, **(db.get_link(link["id"]) or {})}
-
-    def show_viewer(self, link: dict):
-        url = link["final_url"]
-        title = link["title"] or security.display_domain(link["domain"])
-        header = ft.Container(
-            padding=ft.Padding.symmetric(horizontal=4, vertical=4), bgcolor=self.c["surface"],
-            border=ft.Border(bottom=ft.BorderSide(1, self.c["line"])),
-            content=ft.Row([
-                ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Back", on_click=self.act(self.render)),
-                ft.Column([
-                    ft.Text(title, font_family=STRONG, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                    ft.Text(url, size=11, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
-                            color=self.c["muted"]),
-                ], spacing=0, expand=True),
-                ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open in browser",
-                              action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK)),
-                self.copy_button(url),
-            ]),
-        )
-        if link["embeddable"]:
-            body = ft.Column([
-                ft.Text("Page blank or refusing to load? Some sites block being shown inside "
-                        "other apps - use Open in browser.", size=11, color=self.c["muted"]),
-                fwv.WebView(url=url, expand=True),
-            ], expand=True, spacing=4)
-        else:
-            body = ft.Container(
-                expand=True, alignment=ft.Alignment.CENTER, padding=24,
-                content=ft.Column([
-                    ft.Icon(ft.Icons.LINK_OFF, size=48, color=ft.Colors.OUTLINE),
-                    ft.Text(f"{security.display_domain(link['domain'])} doesn't allow itself to be "
-                            "shown inside other apps.", text_align=ft.TextAlign.CENTER),
-                    ft.FilledButton("Open in browser", icon=ft.Icons.OPEN_IN_NEW,
-                                    action=ft.OpenUrl(url, target=ft.UrlTarget.BLANK)),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
-            )
-        self.page.scroll = None
-        self.page.appbar = None
-        self.page.navigation_bar = None
-        self.page.controls = [ft.Column([header, body], expand=True, spacing=0)]
-        self.page.update()
 
     async def edit_link_dialog(self, link: dict):
         title = ft.TextField(label="Title", value=link["title"], max_length=MAX_TITLE)
@@ -871,6 +831,7 @@ class App:
                 ft.Text("Anyone with this link can see this bookmark - no account needed."),
                 ft.Row([ft.TextField(value=url, read_only=True, expand=True, dense=True),
                         self.copy_button(url)]),
+                ft.Row([self.open_url_button(url, "Open share page")]),
             ], tight=True, width=460),
             actions=[ft.TextButton("Revoke all share links", on_click=revoke),
                      ft.TextButton("Done", on_click=self.close_dialog)],
@@ -1064,8 +1025,8 @@ class App:
             self.card([
                 point(ft.Icons.SHIELD, "Checked before it's saved",
                       "Dangerous addresses are refused. Suspicious ones are labelled, and you confirm before opening."),
-                point(ft.Icons.VISIBILITY, "Read here or in your browser",
-                      "Preview pages in the built-in viewer, or open them in a new tab."),
+                point(ft.Icons.OPEN_IN_NEW, "Opens in your browser",
+                      "Tap any link to open it in a new tab, with its safety result shown first if it needs one."),
                 point(ft.Icons.BOLT, "Share without an account",
                       "Paste a link, get a share link, send it to anyone."),
                 ft.Row([ft.OutlinedButton("Quick share", icon=ft.Icons.BOLT, on_click=self.act(self.go, "/quick")),
@@ -1326,6 +1287,7 @@ class App:
                                         "Tap 'Caution' below to see why.", expand=True,
                                         color=self.c["caution"])])))
         out.append(self.link_list([share], "", show_owner=False))
+        out.append(ft.Row([self.open_browser_button(share), self.copy_button(share["final_url"])]))
         if share.get("expires_at"):
             out.append(ft.Text(f"This share link expires in {max(1, (share['expires_at'] - db.now()) // 86400)} days.",
                                size=12, color=ft.Colors.ON_SURFACE_VARIANT))
@@ -1363,6 +1325,7 @@ class App:
                         ft.Text("Your share link is ready", font_family=STRONG)]),
                 ft.Row([ft.TextField(value=share, read_only=True, expand=True, dense=True),
                         self.copy_button(share)]),
+                ft.Row([self.open_url_button(share, "Open share page")], wrap=True),
                 ft.Text(f"Expires in {ANON_SHARE_DAYS} days." if expires else
                         "Manage or revoke it any time from My links.",
                         size=12, color=ft.Colors.ON_SURFACE_VARIANT),
@@ -1399,7 +1362,14 @@ class App:
         for l in db.list_reported_links():
             rows.append(self.card([
                 ft.Text(l["title"] or l["domain"], font_family=STRONG),
-                ft.Text(l["final_url"], size=12, selectable=True),
+                ft.Row([ft.Text(l["final_url"], size=12, selectable=True, expand=True,
+                                color=self.c["primary"]),
+                        self.copy_button(l["final_url"]),
+                        ft.IconButton(ft.Icons.OPEN_IN_NEW, tooltip="Open (shows the warning first)",
+                                      icon_size=18, visual_density=ft.VisualDensity.COMPACT,
+                                      on_click=lambda l=l: self.warn_before_open(
+                                          {**l, "reasons": [f"Reported {l['report_count']} time(s)."]
+                                           + l["reasons"]}))]),
                 ft.Text(f"Owner: {'@' + l['owner_name'] if l['owner_name'] else 'anonymous'}", size=12),
                 ft.Text(f"{l['report_count']} report(s), {'hidden' if l['hidden'] else 'visible'}, "
                         f"status {l['status']}", size=12, color=self.c["muted"]),
